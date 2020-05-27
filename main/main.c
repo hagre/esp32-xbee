@@ -18,10 +18,11 @@
 #include <web_server.h>
 #include <log.h>
 #include <status_led.h>
-#include <socket_client.h>
+#include <interface/socket_client.h>
 #include <esp_sntp.h>
 #include <core_dump.h>
 #include <esp_ota_ops.h>
+#include <stream_stats.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -32,9 +33,9 @@
 
 #include "config.h"
 #include "wifi.h"
-#include "socket_server.h"
+#include "interface/socket_server.h"
 #include "uart.h"
-#include "ntrip.h"
+#include "interface/ntrip.h"
 #include "tasks.h"
 
 static const char *TAG = "MAIN";
@@ -75,6 +76,8 @@ void app_main()
     core_dump_check();
 
     xTaskCreate(reset_button_task, "reset_button", 4096, NULL, TASK_PRIORITY_RESET_BUTTON, NULL);
+
+    stream_stats_init();
 
     config_init();
     uart_init();

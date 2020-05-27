@@ -24,10 +24,12 @@
 #include <wifi.h>
 #include <esp_log.h>
 #include <sys/socket.h>
-#include "socket_client.h"
+#include "interface/socket_client.h"
 
 #include <config.h>
 #include <retry.h>
+#include <stream_stats.h>
+#include <tasks.h>
 
 static const char *TAG = "SOCKET_CLIENT";
 
@@ -36,23 +38,27 @@ static const char *TAG = "SOCKET_CLIENT";
 static int sock = -1;
 
 static status_led_handle_t status_led = NULL;
+static stream_stats_handle_t stream_stats = NULL;
 
-static void socket_client_uart_handler(void* handler_args, esp_event_base_t base, int32_t id, void* event_data) {
+static void socket_client_uart_handler(void* handler_args, esp_event_base_t base, int32_t length, void* buffer) {
     if (sock == -1) return;
-    uart_data_t *data = event_data;
 
-    int err = write(sock, data->buffer, data->len);
+    stream_stats_increment(stream_stats, 0, length);
+
+    int err = write(sock, buffer, length);
     if (err < 0) destroy_socket(&sock);
 }
 
 static void socket_client_task(void *ctx) {
-    uart_register_handler(socket_client_uart_handler);
+    uart_register_read_handler(socket_client_uart_handler);
 
     config_color_t status_led_color = config_get_color(CONF_ITEM(KEY_CONFIG_SOCKET_CLIENT_COLOR));
     if (status_led_color.rgba != 0) status_led = status_led_add(status_led_color.rgba, STATUS_LED_FADE, 500, 2000, 0);
     if (status_led != NULL) status_led->active = false;
 
-    retry_delay_handle_t delay_handle = retry_init(true, 5, 2000);
+    stream_stats = stream_stats_new("socket_client");
+
+    retry_delay_handle_t delay_handle = retry_init(true, 5, 2000, 0);
 
     while (true) {
         retry_delay(delay_handle);
@@ -87,6 +93,8 @@ static void socket_client_task(void *ctx) {
         int len;
         while ((len = read(sock, buffer, BUFFER_SIZE)) >= 0) {
             uart_write(buffer, len);
+
+            stream_stats_increment(stream_stats, len, 0);
         }
 
         free(buffer);
@@ -109,5 +117,5 @@ static void socket_client_task(void *ctx) {
 void socket_client_init() {
     if (!config_get_bool1(CONF_ITEM(KEY_CONFIG_SOCKET_CLIENT_ACTIVE))) return;
 
-    xTaskCreate(socket_client_task, "socket_client_task", 4096, NULL, 2, NULL);
+    xTaskCreate(socket_client_task, "socket_client_task", 4096, NULL, TASK_PRIORITY_INTERFACE, NULL);
 }

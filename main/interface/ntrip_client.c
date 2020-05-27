@@ -23,7 +23,10 @@
 #include <tasks.h>
 #include <status_led.h>
 #include <retry.h>
-#include "ntrip.h"
+#include <stream_stats.h>
+#include <freertos/event_groups.h>
+#include <esp_ota_ops.h>
+#include "interface/ntrip.h"
 #include "config.h"
 #include "util.h"
 #include "uart.h"
@@ -32,26 +35,38 @@ static const char *TAG = "NTRIP_CLIENT";
 
 #define BUFFER_SIZE 512
 
+static const int CASTER_READY_BIT = BIT0;
+
 static int sock = -1;
 
+static EventGroupHandle_t client_event_group;
+
 static status_led_handle_t status_led = NULL;
+static stream_stats_handle_t stream_stats = NULL;
 
-static void ntrip_client_uart_handler(void* handler_args, esp_event_base_t base, int32_t id, void* event_data) {
-    if (sock == -1) return;
+static void ntrip_client_uart_handler(void* handler_args, esp_event_base_t base, int32_t length, void* buffer) {
+    // Caster connected and ready for data
+    if ((xEventGroupGetBits(client_event_group) & CASTER_READY_BIT) == 0) return;
 
-    uart_data_t *data = event_data;
-    int sent = send(sock, data->buffer, data->len, 0);
-    if (sent < 0) destroy_socket(&sock);
+    int sent = send(sock, buffer, length, 0);
+    if (sent < 0) {
+        destroy_socket(&sock);
+    } else {
+        stream_stats_increment(stream_stats, 0, sent);
+    }
 }
 
 static void ntrip_client_task(void *ctx) {
-    uart_register_handler(ntrip_client_uart_handler);
+    client_event_group = xEventGroupCreate();
+    uart_register_read_handler(ntrip_client_uart_handler);
 
     config_color_t status_led_color = config_get_color(CONF_ITEM(KEY_CONFIG_NTRIP_CLIENT_COLOR));
     if (status_led_color.rgba != 0) status_led = status_led_add(status_led_color.rgba, STATUS_LED_FADE, 500, 2000, 0);
     if (status_led != NULL) status_led->active = false;
 
-    retry_delay_handle_t delay_handle = retry_init(true, 5, 2000);
+    stream_stats = stream_stats_new("ntrip_client");
+
+    retry_delay_handle_t delay_handle = retry_init(true, 5, 2000, 0);
 
     while (true) {
         retry_delay(delay_handle);
@@ -77,10 +92,10 @@ static void ntrip_client_task(void *ctx) {
 
         char *authorization = http_auth_basic_header(username, password);
         snprintf(buffer, BUFFER_SIZE, "GET /%s HTTP/1.1" NEWLINE \
-                "User-Agent: NTRIP %s/1.0" NEWLINE \
+                "User-Agent: NTRIP %s/%s" NEWLINE \
                 "Authorization: %s" NEWLINE
                 NEWLINE
-                , mountpoint, NTRIP_CLIENT_NAME, authorization);
+                , mountpoint, NTRIP_CLIENT_NAME, &esp_ota_get_app_description()->version[1], authorization);
         free(authorization);
 
         int err = write(sock, buffer, strlen(buffer));
@@ -91,7 +106,10 @@ static void ntrip_client_task(void *ctx) {
         buffer[len] = '\0';
 
         char *status = extract_http_header(buffer, "");
-        ERROR_ACTION(TAG, status == NULL || !ntrip_response_ok(status), free(status); goto _error, "Could not connect to mountpoint: %s", status == NULL ? "HTTP response malformed" : status);
+        ERROR_ACTION(TAG, status == NULL || !ntrip_response_ok(status), free(status); goto _error,
+                "Could not connect to mountpoint: %s",
+                status == NULL ? "HTTP response malformed" :
+                        (ntrip_response_sourcetable_ok(status) ? "Mountpoint not found" : status))
         free(status);
 
         ESP_LOGI(TAG, "Successfully connected to %s:%d/%s", host, port, mountpoint);
@@ -101,9 +119,18 @@ static void ntrip_client_task(void *ctx) {
 
         if (status_led != NULL) status_led->active = true;
 
-        while ((len = read(sock, buffer, BUFFER_SIZE)) >= 0) {
+        // Connected
+        xEventGroupSetBits(client_event_group, CASTER_READY_BIT);
+
+        // Read from socket until disconnected
+        while (sock != -1 && (len = read(sock, buffer, BUFFER_SIZE)) >= 0) {
             uart_write(buffer, len);
+
+            stream_stats_increment(stream_stats, len, 0);
         }
+
+        // Disconnected
+        xEventGroupSetBits(client_event_group, CASTER_READY_BIT);
 
         if (status_led != NULL) status_led->active = false;
 
@@ -126,5 +153,5 @@ static void ntrip_client_task(void *ctx) {
 void ntrip_client_init() {
     if (!config_get_bool1(CONF_ITEM(KEY_CONFIG_NTRIP_CLIENT_ACTIVE))) return;
 
-    xTaskCreate(ntrip_client_task, "ntrip_client_task", 4096, NULL, TASK_PRIORITY_NTRIP, NULL);
+    xTaskCreate(ntrip_client_task, "ntrip_client_task", 4096, NULL, TASK_PRIORITY_INTERFACE, NULL);
 }

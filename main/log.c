@@ -19,8 +19,11 @@
 #include <esp_err.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/ringbuf.h>
+#include <string.h>
 #include <uart.h>
 #include "log.h"
+
+#define INITIAL_MAGIC "@@@@\n"
 
 static const char *TAG = "LOG";
 
@@ -33,6 +36,9 @@ esp_err_t log_init() {
         return ESP_FAIL;
     }
 
+    // Magic string to let web log know that ESP32 has restart (to reset line counter)
+    xRingbufferSend(ringbuf_handle, INITIAL_MAGIC, strlen(INITIAL_MAGIC), 0);
+
     return ESP_OK;
 }
 
@@ -40,13 +46,14 @@ int log_vprintf(const char * format, va_list arg) {
     char buffer[512];
     int n = vsnprintf(buffer, 512, format, arg);
 
-    if (!xRingbufferSend(ringbuf_handle, buffer, n, 0)) {
-        return 0;
-    }
-
     if (n > 512) {
         n = 512;
     }
+
+    // Remove log colors for web log buffer
+    xRingbufferSend(ringbuf_handle, buffer + strlen(LOG_COLOR_E),
+            n - strlen(LOG_COLOR_E) - strlen(LOG_RESET_COLOR) - 1, 0);
+    xRingbufferSend(ringbuf_handle, "\n", 1, 0);
 
     uart_log(buffer, n);
 
